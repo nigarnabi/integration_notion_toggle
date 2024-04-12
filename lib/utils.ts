@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { prisma } from "./prisma";
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -19,3 +20,12 @@ function friendlyAuthError(code: string) {
   }
 }
 export { friendlyAuthError };
+
+//function fetch user Notion token from database
+export async function getNotionAccessToken(userId: string) {
+  const acc = await prisma.account.findFirst({
+    where: { userId, provider: "notion" },
+    select: { access_token: true },
+  });
+  return acc?.access_token ?? null;
+}
