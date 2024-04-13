@@ -1,21 +1,27 @@
-// app/dashboard/page.tsx
 import Image from "next/image";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth, signOut } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import TogglConnectForm from "../api/toggl/components/TogglConnectForm";
 
 export default async function Dashboard() {
   const session = await auth();
   const user = session?.user;
-  if (!user?.id) redirect("/signin");
+  if (!user?.id) redirect("/");
 
-  const [notionAccount] = await Promise.all([
+  const [notionAccount, userRow] = await Promise.all([
     prisma.account.findFirst({
-      where: { userId: user!.id, provider: "notion" },
+      where: { userId: user.id, provider: "notion" },
       select: { id: true },
     }),
+    prisma.user.findUnique({
+      where: { id: user.id },
+      select: { toggleApiKeyEnc: true, togglLastVerifiedAt: true },
+    }),
   ]);
+
+  const togglConnected = !!userRow?.toggleApiKeyEnc;
 
   return (
     <main className="min-h-[calc(100vh-56px)] px-6 py-8 bg-[var(--color-primary-light-green)]/15">
@@ -48,7 +54,7 @@ export default async function Dashboard() {
           <form
             action={async () => {
               "use server";
-              await signOut();
+              await signOut({ redirectTo: "/" });
             }}
           >
             <button
@@ -70,11 +76,16 @@ export default async function Dashboard() {
             okText="Connected"
             notOkText="Not connected"
           />
-          <StatusCard label="Toggl" ok={false} />
+          <StatusCard
+            label="Toggl"
+            ok={togglConnected}
+            okText="Connected"
+            notOkText="Not connected"
+          />
           <StatusCard label="Stripe" ok={false} />
         </section>
 
-        {/* Next steps */}
+        {/* Get started */}
         <section className="rounded-2xl border bg-white/70 backdrop-blur p-5">
           <h2 className="text-lg font-medium text-[var(--color-primary-deep-brown)]">
             Get started
@@ -111,6 +122,25 @@ export default async function Dashboard() {
               Choose Plan
             </Link>
           </div>
+        </section>
+
+        {/* Toggl connect block */}
+        <section className="rounded-2xl border bg-white/70 backdrop-blur p-5">
+          <h2 className="text-lg font-medium text-[var(--color-primary-deep-brown)]">
+            Toggl
+          </h2>
+          <p className="text-sm text-[var(--color-primary-sage)] mb-3">
+            {togglConnected
+              ? `Connected ✅${
+                  userRow?.togglLastVerifiedAt
+                    ? ` • verified ${new Date(
+                        userRow.togglLastVerifiedAt
+                      ).toLocaleString()}`
+                    : ""
+                }`
+              : "Not connected"}
+          </p>
+          {!togglConnected && <TogglConnectForm />}
         </section>
       </div>
     </main>
