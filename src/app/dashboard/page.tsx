@@ -113,7 +113,7 @@ export default async function Dashboard() {
               Connect Toggl
             </Link>
             <Link
-              href="/onboarding/plan"
+              href="/api/stripe"
               className="rounded-full px-4 py-2 text-sm border
                          border-[var(--color-primary-golden)]
                          text-[var(--color-primary-golden)]
