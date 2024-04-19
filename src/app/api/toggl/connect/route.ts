@@ -1,6 +1,7 @@
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { encryptToString } from "@/lib/crypto";
+import { revalidatePath } from "next/cache";
 
 export async function POST(req: Request) {
   const session = await auth();
@@ -34,5 +35,6 @@ export async function POST(req: Request) {
       togglLastVerifiedAt: new Date(),
     },
   });
+  revalidatePath("/dashboard");
   return Response.json({ success: true });
 }

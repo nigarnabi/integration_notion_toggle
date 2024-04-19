@@ -1,6 +1,9 @@
+import { auth } from "@/lib/auth";
 import { NavbarClient } from "./ClientNavbar";
 
 export async function NavbarServer() {
-  const isSignedIn = false; // or fetch session via auth()
+  const session = await auth();
+  const isSignedIn = !!session?.user;
+
   return <NavbarClient isSignedIn={isSignedIn} />;
 }

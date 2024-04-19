@@ -1,4 +1,3 @@
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,28 +8,42 @@ datasource db {
   // directUrl = env("DIRECT_URL") // optional with Neon for migrations
 }
 
+//
+// ────────────────────────────────
+// AUTH + BILLING MODELS
+// ────────────────────────────────
+//
 model User {
-  id        String   @id @default(cuid())
-  email     String?  @unique
-  name      String?
-  image     String?
-    emailVerified DateTime?  
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id            String    @id @default(cuid())
+  email         String?   @unique
+  name          String?
+  image         String?
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  // Toggle fields 
-  toggleApiKeyEnc String?
+  // Toggl fields
+  toggleApiKeyEnc     String?
   togglLastVerifiedAt DateTime?
 
-
-   // Stripe fields
-  stripeCustomerId String?  @unique
-  stripeSubId      String?  @unique
+  // Stripe fields
+  stripeCustomerId String? @unique
+  stripeSubId      String? @unique
   plan             String?
   subStatus        String?
-    accounts Account[]
+
+  // Auth relations
+  accounts Account[]
   sessions Session[]
+
+  // Sync relations
+  taskMappings   TaskMapping[]
+  timeEntryLinks TimeEntryLink[]
+  outboxJobs     OutboxJob[]
+  webhookEvents  WebhookEvent[]
+  syncState      SyncState?
 }
+
 model Account {
   id                String  @id @default(cuid())
   userId            String
@@ -65,4 +78,123 @@ model VerificationToken {
   expires    DateTime
 
   @@unique([identifier, token])
+}
+
+//
+// ────────────────────────────────
+// ENUMS
+// ────────────────────────────────
+//
+// ---------- Enums ----------
+enum TimerOrigin {
+  NOTION
+  TOGGL
+}
+
+enum TimerStatus {
+  RUNNING
+  STOPPED
+  ORPHANED
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+}
+
+//
+// ────────────────────────────────
+// SYNC TABLES
+// ────────────────────────────────
+//
+
+// ---------- Task ↔ Toggl mapping ----------
+model TaskMapping {
+  id               String    @id @default(cuid())
+  userId           String
+  notionTaskPageId String
+  notionDatabaseId String?
+  togglProjectId   String?
+  togglTaskId      String?
+  taskNameSnapshot String?
+  lastSyncedAt     DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Time entries referencing this mapping
+  timeEntries TimeEntryLink[]
+
+  @@unique([userId, notionTaskPageId])
+  @@index([userId, togglTaskId])
+  @@index([userId, togglProjectId])
+}
+
+// ---------- Timer session link (start/stop) ----------
+model TimeEntryLink {
+  id               String      @id @default(cuid())
+  userId           String
+  notionTaskPageId String
+  togglTimeEntryId String?
+  mappingId        String?
+  origin           TimerOrigin
+  status           TimerStatus @default(RUNNING)
+  startTs          DateTime
+  stopTs           DateTime?
+  lastSeenAt       DateTime?
+
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  mapping TaskMapping? @relation(fields: [mappingId], references: [id], onDelete: SetNull)
+
+ 
+  @@index([userId, togglTimeEntryId])
+  @@index([mappingId])
+}
+
+// ---------- Inbound Notion events (dedupe/audit) ----------
+model WebhookEvent {
+  id             String    @id
+  userId         String?
+  type           String
+  subscriptionId String?
+  receivedAt     DateTime  @default(now())
+  payload        Json
+  processedAt    DateTime?
+  payloadHash    String?
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([type, receivedAt])
+  @@index([userId, receivedAt])
+}
+
+// ---------- Outbox jobs (reliable async calls) ----------
+model OutboxJob {
+  id             String    @id @default(cuid())
+  userId         String
+  kind           String
+  payload        Json
+  idempotencyKey String
+  status         JobStatus @default(PENDING)
+  attempt        Int       @default(0)
+  nextRunAt      DateTime  @default(now())
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([idempotencyKey])
+  @@index([status, nextRunAt])
+  @@index([userId])
+}
+
+// ---------- Per-user cursors/state ----------
+model SyncState {
+  userId           String    @id
+  lastTogglPollAt  DateTime?
+  lastNotionSyncAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

@@ -3,6 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { signOut } from "next-auth/react";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -11,7 +12,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
-import { Menu } from "lucide-react";
+import { Menu, User } from "lucide-react";
 
 function LogoIcon({
   className = "text-[var(--color-primary-deep-brown)]",
@@ -28,7 +29,6 @@ function LogoIcon({
       className={className}
       aria-hidden="true"
     >
-      {/* Two curved sync arrows forming a circle */}
       <path
         d="M16 4C9.373 4 4 9.373 4 16c0 1.5.275 2.938.777 4.264"
         stroke="currentColor"
@@ -41,7 +41,6 @@ function LogoIcon({
         strokeWidth="2.5"
         strokeLinecap="round"
       />
-      {/* Arrow heads */}
       <path
         d="M4.5 18l-2 2.5 2.5 2"
         stroke="currentColor"
@@ -104,20 +103,35 @@ export function NavbarClient({ isSignedIn }: { isSignedIn?: boolean }) {
             ))}
           </div>
 
-          {/* Desktop Actions */}
+          {/* Desktop Auth Buttons */}
           <div className="hidden md:flex items-center gap-3">
             {isSignedIn ? (
-              <Link href="/dashboard">
+              <>
+                {/* User Dashboard Icon */}
+                <Link href="/dashboard" aria-label="Go to dashboard">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="text-[var(--color-primary-deep-brown)]
+                               hover:text-white hover:bg-[var(--color-primary-deep-brown)]
+                               transition-all"
+                  >
+                    <User className="h-5 w-5" />
+                  </Button>
+                </Link>
+
+                {/* Sign Out */}
                 <Button
                   variant="outline"
+                  onClick={() => signOut({ callbackUrl: "/" })}
                   className="border-[var(--color-primary-deep-brown)]
                              text-[var(--color-primary-deep-brown)]
                              hover:bg-[var(--color-primary-deep-brown)]
                              hover:text-white transition-all"
                 >
-                  Dashboard
+                  Sign out
                 </Button>
-              </Link>
+              </>
             ) : (
               <Link href="/api/auth/signin">
                 <Button
@@ -140,6 +154,7 @@ export function NavbarClient({ isSignedIn }: { isSignedIn?: boolean }) {
     </nav>
   );
 }
+
 function MobileMenu({ isSignedIn }: { isSignedIn?: boolean }) {
   return (
     <Sheet>
@@ -178,19 +193,33 @@ function MobileMenu({ isSignedIn }: { isSignedIn?: boolean }) {
             </Link>
           ))}
 
-          <div className="mt-4">
+          <div className="mt-4 flex flex-col gap-2">
             {isSignedIn ? (
-              <Link href="/dashboard">
+              <>
+                {/* Dashboard Icon */}
+                <Link href="/dashboard" className="flex justify-center">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="text-[var(--color-primary-deep-brown)]
+                               hover:text-white hover:bg-[var(--color-primary-deep-brown)]"
+                  >
+                    <User className="h-5 w-5" />
+                  </Button>
+                </Link>
+
+                {/* Sign Out */}
                 <Button
+                  onClick={() => signOut({ callbackUrl: "/" })}
                   className="w-full border-[var(--color-primary-deep-brown)]
                              text-[var(--color-primary-deep-brown)]
                              hover:bg-[var(--color-primary-deep-brown)]
                              hover:text-white"
                   variant="outline"
                 >
-                  Dashboard
+                  Sign out
                 </Button>
-              </Link>
+              </>
             ) : (
               <Link href="/api/auth/signin">
                 <Button
