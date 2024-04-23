@@ -206,6 +206,55 @@ async function stopTogglTimeEntry(opts: {
   }
 }
 
+//notion timer helpers
+
+async function setNotionTimerStarted(
+  notionToken: string,
+  pageId: string,
+  startISO: string,
+  propertyName = "Timer Started",
+  apiVersion = "2022-06-28"
+) {
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${notionToken}`,
+      "Notion-Version": apiVersion,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      properties: { [propertyName]: { date: { start: startISO } } },
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      `Failed to set Timer Started: ${res.status} ${await res.text()}`
+    );
+}
+
+async function clearNotionTimerStarted(
+  notionToken: string,
+  pageId: string,
+  propertyName = "Timer Started",
+  apiVersion = "2022-06-28"
+) {
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${notionToken}`,
+      "Notion-Version": apiVersion,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      properties: { [propertyName]: { date: null } },
+    }),
+  });
+  if (!res.ok)
+    throw new Error(
+      `Failed to clear Timer Started: ${res.status} ${await res.text()}`
+    );
+}
+
 // --------------- ROUTE (single job runner) ---------------
 export async function POST() {
   // 1) Pick ONE pending job that is due
@@ -379,6 +428,118 @@ export async function POST() {
           data: { status: "DONE", lastError: null },
         });
 
+        return NextResponse.json({ ok: true, processed: 1, kind: locked.kind });
+      }
+      case "NOTION_MARK_STARTED": {
+        const payload = locked.payload as {
+          userId: string;
+          pageId: string;
+          togglEntryId: string;
+          startTs?: string;
+          apiVersion?: string;
+          origin?: "TOGGL" | "NOTION";
+        };
+        const { userId, pageId, togglEntryId, startTs, apiVersion } = payload;
+        if (!userId || !pageId || !togglEntryId)
+          throw new Error("Missing fields");
+
+        const { notionToken, togglToken } = await getUserSecrets(userId);
+        const workspaceId = await getTogglWorkspaceId(togglToken);
+        const startedAt = startTs ? new Date(startTs) : new Date();
+
+        // Ensure link exists and is RUNNING (no compound unique; use findFirst)
+        const existing = await prisma.timeEntryLink.findFirst({
+          where: { userId, togglTimeEntryId: String(togglEntryId) },
+          select: { id: true },
+        });
+
+        if (existing) {
+          await prisma.timeEntryLink.update({
+            where: { id: existing.id },
+            data: {
+              notionTaskPageId: pageId,
+              status: "RUNNING",
+              startTs: startedAt,
+              lastSeenAt: new Date(),
+              togglWorkspaceId: workspaceId,
+              origin: "TOGGL",
+            },
+          });
+        } else {
+          await prisma.timeEntryLink.create({
+            data: {
+              userId,
+              notionTaskPageId: pageId,
+              togglTimeEntryId: String(togglEntryId),
+              origin: "TOGGL",
+              status: "RUNNING",
+              startTs: startedAt,
+              lastSeenAt: new Date(),
+              togglWorkspaceId: workspaceId,
+            },
+          });
+        }
+
+        // Update Notion (TEID then date)
+        await setNotionTogglEntryId(
+          notionToken,
+          pageId,
+          String(togglEntryId),
+          "Toggl Entry ID",
+          apiVersion
+        );
+        await setNotionTimerStarted(
+          notionToken,
+          pageId,
+          startedAt.toISOString(),
+          "Timer Started",
+          apiVersion
+        );
+
+        await prisma.outboxJob.update({
+          where: { id: locked.id },
+          data: { status: "DONE", lastError: null },
+        });
+        return NextResponse.json({ ok: true, processed: 1, kind: locked.kind });
+      }
+
+      case "NOTION_MARK_STOPPED": {
+        const payload = locked.payload as {
+          userId: string;
+          pageId: string;
+          togglEntryId: string;
+          stopTs?: string;
+          apiVersion?: string;
+          origin?: "TOGGL" | "NOTION";
+        };
+        const { userId, pageId, togglEntryId, stopTs, apiVersion } = payload;
+        if (!userId || !pageId || !togglEntryId)
+          throw new Error("Missing fields");
+
+        const { notionToken } = await getUserSecrets(userId);
+        const endedAt = stopTs ? new Date(stopTs) : new Date();
+
+        await prisma.timeEntryLink.updateMany({
+          where: {
+            userId,
+            notionTaskPageId: pageId,
+            togglTimeEntryId: String(togglEntryId),
+          },
+          data: { status: "STOPPED", stopTs: endedAt, lastSeenAt: new Date() },
+        });
+
+        await clearNotionTimerStarted(
+          notionToken,
+          pageId,
+          "Timer Started",
+          apiVersion
+        );
+        // (Optionally keep or clear TEID — your webhook ignores TEID-only updates)
+
+        await prisma.outboxJob.update({
+          where: { id: locked.id },
+          data: { status: "DONE", lastError: null },
+        });
         return NextResponse.json({ ok: true, processed: 1, kind: locked.kind });
       }
 

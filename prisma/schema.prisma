@@ -116,19 +116,19 @@ model TaskMapping {
   userId           String
   notionTaskPageId String
   notionDatabaseId String?
+  togglWorkspaceId Int? // NEW
   togglProjectId   String?
   togglTaskId      String?
   taskNameSnapshot String?
   lastSyncedAt     DateTime?
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  // Time entries referencing this mapping
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   timeEntries TimeEntryLink[]
 
   @@unique([userId, notionTaskPageId])
   @@index([userId, togglTaskId])
   @@index([userId, togglProjectId])
+  @@index([userId, togglWorkspaceId]) // NEW
 }
 
 // ---------- Timer session link (start/stop) ----------
@@ -144,12 +144,20 @@ model TimeEntryLink {
   stopTs           DateTime?
   lastSeenAt       DateTime?
 
+  // NEW: Toggl metadata (lets us reconcile without extra API calls)
+  togglWorkspaceId    Int?
+  togglProjectId      String?
+  togglTaskId         String?
+  togglUpdatedAt      DateTime? // last seen Toggl 'at'
+  descriptionSnapshot String?
+
   user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   mapping TaskMapping? @relation(fields: [mappingId], references: [id], onDelete: SetNull)
 
- 
+  @@unique([userId, togglTimeEntryId]) // ensures 1 link per entry per user
   @@index([userId, togglTimeEntryId])
   @@index([mappingId])
+  @@index([userId, notionTaskPageId, status]) // fast “is running?” checks
 }
 
 // ---------- Inbound Notion events (dedupe/audit) ----------
@@ -190,11 +198,10 @@ model OutboxJob {
   @@index([userId])
 }
 
-// ---------- Per-user cursors/state ----------
 model SyncState {
   userId           String    @id
   lastTogglPollAt  DateTime?
   lastNotionSyncAt DateTime?
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lastTogglAtSeen  DateTime?
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
