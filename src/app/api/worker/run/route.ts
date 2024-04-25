@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { decryptFromString } from "@/lib/crypto";
+import crypto from "crypto";
 
 // --------------- Small helpers ---------------
 const now = () => new Date();
@@ -39,7 +40,6 @@ async function getTogglWorkspaceId(togglToken: string): Promise<number> {
   });
   if (!res.ok) throw new Error(`Toggl /me failed: ${res.status}`);
   const me = await res.json();
-  // Prefer default_workspace_id, else first workspace id
   const ws =
     me?.default_workspace_id ??
     (Array.isArray(me?.workspaces) && me.workspaces.length
@@ -64,6 +64,7 @@ function readTitleFromPage(page: any): string {
   return "Untitled";
 }
 
+// --- Notion raw API helpers ---
 async function getNotionPage(
   notionToken: string,
   pageId: string,
@@ -81,6 +82,44 @@ async function getNotionPage(
   return res.json();
 }
 
+async function createNotionPageInDb(opts: {
+  notionToken: string;
+  databaseId: string;
+  title: string;
+  titleProp?: string;
+  apiVersion?: string;
+}) {
+  debugger;
+  const {
+    notionToken,
+    databaseId,
+    title,
+    titleProp = "Task name",
+    apiVersion = "2022-06-28",
+  } = opts;
+
+  const res = await fetch("https://api.notion.com/v1/pages", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${notionToken}`,
+      "Notion-Version": apiVersion,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      parent: { database_id: databaseId },
+      properties: {
+        [titleProp]: { title: [{ type: "text", text: { content: title } }] },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Notion create page failed: ${res.status} ${txt}`);
+  }
+  return res.json();
+}
+
 async function setNotionTogglEntryId(
   notionToken: string,
   pageId: string,
@@ -88,7 +127,6 @@ async function setNotionTogglEntryId(
   propertyName = "Toggl Entry ID",
   apiVersion = "2022-06-28"
 ) {
-  // Write TEID as rich_text
   const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
     method: "PATCH",
     headers: {
@@ -114,42 +152,6 @@ async function setNotionTogglEntryId(
   }
 }
 
-async function startTogglTimeEntry(opts: {
-  togglToken: string;
-  workspaceId: number;
-  description: string;
-  startISO: string;
-  projectId?: number | null;
-  taskId?: number | null;
-}) {
-  const body: any = {
-    start: opts.startISO,
-    duration: -1,
-    created_with: "NotionTogglSync",
-    description: opts.description || "Notion Task",
-    wid: opts.workspaceId,
-  };
-  if (opts.projectId) body.project_id = opts.projectId;
-  if (opts.taskId) body.task_id = opts.taskId;
-
-  const res = await fetch(
-    `https://api.track.toggl.com/api/v9/workspaces/${opts.workspaceId}/time_entries`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: basicAuthHeader(opts.togglToken),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    }
-  );
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Toggl start time entry failed: ${res.status} ${txt}`);
-  }
-  const json = await res.json();
-  return json;
-}
 async function readNotionTogglEntryId(
   notionToken: string,
   pageId: string,
@@ -187,6 +189,44 @@ async function clearNotionTogglEntryId(
   });
 }
 
+// Toggl helpers
+async function startTogglTimeEntry(opts: {
+  togglToken: string;
+  workspaceId: number;
+  description: string;
+  startISO: string;
+  projectId?: number | null;
+  taskId?: number | null;
+}) {
+  const body: any = {
+    start: opts.startISO,
+    duration: -1,
+    created_with: "NotionTogglSync",
+    description: opts.description || "Notion Task",
+    wid: opts.workspaceId,
+  };
+  if (opts.projectId) body.project_id = opts.projectId;
+  if (opts.taskId) body.task_id = opts.taskId;
+
+  const res = await fetch(
+    `https://api.track.toggl.com/api/v9/workspaces/${opts.workspaceId}/time_entries`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: basicAuthHeader(opts.togglToken),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Toggl start time entry failed: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  return json;
+}
+
 async function stopTogglTimeEntry(opts: {
   togglToken: string;
   workspaceId: number;
@@ -199,15 +239,13 @@ async function stopTogglTimeEntry(opts: {
       headers: { Authorization: basicAuthHeader(opts.togglToken) },
     }
   );
-  // Treat 404 as idempotent success (already stopped/deleted)
   if (!res.ok && res.status !== 404) {
     const txt = await res.text();
     throw new Error(`Toggl stop failed: ${res.status} ${txt}`);
   }
 }
 
-//notion timer helpers
-
+// Notion timer helpers
 async function setNotionTimerStarted(
   notionToken: string,
   pageId: string,
@@ -255,6 +293,51 @@ async function clearNotionTimerStarted(
     );
 }
 
+// ---------- Two-way sync glue (mapping + fingerprint) ----------
+function normalizeTitle(s: string | null | undefined): string {
+  if (!s) return "";
+  const collapsed = s
+    .toLowerCase()
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ");
+  // strip leading/trailing punctuation/symbols
+  return collapsed.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, "");
+}
+
+function buildTaskFingerprint(opts: {
+  description?: string | null;
+  projectId?: number | string | null;
+  tagIds?: Array<number | string> | null;
+  workspaceId?: number | string | null;
+}): string {
+  const desc = normalizeTitle(opts.description ?? "");
+  const proj = opts.projectId ?? "0";
+  const ws = opts.workspaceId ?? "0";
+  const tags = (opts.tagIds ?? []).map(String).sort().join(",");
+  const raw = `${desc}|${proj}|${tags}|${ws}`;
+  return crypto.createHash("sha1").update(raw, "utf8").digest("hex");
+}
+
+function togglIsRunning(duration: number | null | undefined): boolean {
+  return typeof duration === "number" && duration < 0;
+}
+
+function parseDateOrNull(x: string | null | undefined): Date | null {
+  if (!x) return null;
+  const d = new Date(x);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+async function resolveTargetDatabaseId(_userId: string): Promise<string> {
+  const dbId = process.env.NOTION_TASKS_DB_ID;
+  if (!dbId)
+    throw new Error(
+      "NOTION_TASKS_DB_ID is not set and no per-user DB configured."
+    );
+  return dbId;
+}
+
 // --------------- ROUTE (single job runner) ---------------
 export async function POST() {
   // 1) Pick ONE pending job that is due
@@ -278,8 +361,172 @@ export async function POST() {
 
   try {
     switch (locked.kind) {
+      // ---------- NEW: Ensure mapping & link from an observed Toggl entry ----------
+      case "ENSURE_MAPPING_FROM_TOGGL": {
+        const payload = locked.payload as {
+          userId: string;
+          togglEntry: {
+            id: string;
+            description: string | null;
+            start: string | null;
+            stop: string | null;
+            duration: number | null;
+            at: string | null;
+            project_id: number | null;
+            task_id: number | null;
+            workspace_id: number | null;
+            tag_ids: number[] | null;
+          };
+        };
+
+        const { userId, togglEntry } = payload;
+        if (!userId || !togglEntry?.id)
+          throw new Error("Missing userId/togglEntry.id in payload");
+
+        const { notionToken } = await getUserSecrets(userId);
+        const dbId = await resolveTargetDatabaseId(userId);
+
+        // 1) Fingerprint
+        const fingerprint = buildTaskFingerprint({
+          description: togglEntry.description ?? "",
+          projectId: togglEntry.project_id ?? 0,
+          tagIds: togglEntry.tag_ids ?? [],
+          workspaceId: togglEntry.workspace_id ?? 0,
+        });
+
+        // 2) Find existing mapping by fingerprint
+        let mapping = await prisma.taskMapping.findFirst({
+          where: { userId, matchFingerprint: fingerprint },
+          select: { id: true, notionTaskPageId: true, notionDatabaseId: true },
+        });
+
+        // 3) If missing → create a Notion page + mapping
+        if (!mapping) {
+          const title =
+            normalizeTitle(togglEntry.description) || "Untitled from Toggl";
+          const created = await createNotionPageInDb({
+            notionToken,
+            databaseId: dbId,
+            title,
+            titleProp: "Task name",
+          });
+
+          mapping = await prisma.taskMapping.create({
+            data: {
+              userId,
+              notionTaskPageId: created.id,
+              notionDatabaseId: dbId,
+              togglWorkspaceId: togglEntry.workspace_id ?? undefined,
+              togglProjectId: togglEntry.project_id
+                ? String(togglEntry.project_id)
+                : undefined,
+              togglTaskId: togglEntry.task_id
+                ? String(togglEntry.task_id)
+                : undefined,
+              taskNameSnapshot: title,
+              matchFingerprint: fingerprint,
+              lastSyncedAt: new Date(),
+            },
+            select: {
+              id: true,
+              notionTaskPageId: true,
+              notionDatabaseId: true,
+            },
+          });
+        }
+
+        // 4) Upsert TimeEntryLink
+        const running = togglIsRunning(togglEntry.duration);
+        const startTs = parseDateOrNull(togglEntry.start) ?? new Date();
+        const stopTs = parseDateOrNull(togglEntry.stop);
+        const togglUpdated = parseDateOrNull(togglEntry.at) ?? new Date();
+
+        await prisma.timeEntryLink.upsert({
+          where: {
+            userId_togglTimeEntryId: {
+              userId,
+              togglTimeEntryId: String(togglEntry.id),
+            },
+          },
+          update: {
+            mappingId: mapping.id,
+            notionTaskPageId: mapping.notionTaskPageId,
+            origin: "TOGGL",
+            status: running ? "RUNNING" : "STOPPED",
+            startTs,
+            stopTs: running ? null : stopTs ?? undefined,
+            lastSeenAt: new Date(),
+            togglWorkspaceId: togglEntry.workspace_id ?? undefined,
+            togglProjectId: togglEntry.project_id
+              ? String(togglEntry.project_id)
+              : undefined,
+            togglTaskId: togglEntry.task_id
+              ? String(togglEntry.task_id)
+              : undefined,
+            togglUpdatedAt: togglUpdated,
+            descriptionSnapshot: togglEntry.description ?? undefined,
+          },
+          create: {
+            userId,
+            mappingId: mapping.id,
+            notionTaskPageId: mapping.notionTaskPageId,
+            togglTimeEntryId: String(togglEntry.id),
+            origin: "TOGGL",
+            status: running ? "RUNNING" : "STOPPED",
+            startTs,
+            stopTs: running ? null : stopTs ?? undefined,
+            lastSeenAt: new Date(),
+            togglWorkspaceId: togglEntry.workspace_id ?? undefined,
+            togglProjectId: togglEntry.project_id
+              ? String(togglEntry.project_id)
+              : undefined,
+            togglTaskId: togglEntry.task_id
+              ? String(togglEntry.task_id)
+              : undefined,
+            togglUpdatedAt: togglUpdated,
+            descriptionSnapshot: togglEntry.description ?? undefined,
+          },
+        });
+
+        // 5) Enqueue mirror job for Notion state flip (idempotent)
+        const atIso = togglUpdated.toISOString();
+        const idBase = `${userId}:${togglEntry.id}:${atIso}`;
+
+        const kind = running ? "NOTION_MARK_STARTED" : "NOTION_MARK_STOPPED";
+        const idempotencyKey = `ensured->notion:${
+          running ? "start" : "stop"
+        }:${idBase}`;
+        await prisma.outboxJob.upsert({
+          where: { idempotencyKey },
+          update: {},
+          create: {
+            userId,
+            kind,
+            idempotencyKey,
+            status: "PENDING",
+            payload: {
+              userId,
+              pageId: mapping.notionTaskPageId,
+              togglEntryId: String(togglEntry.id),
+              ...(running
+                ? { startTs: togglEntry.start ?? new Date().toISOString() }
+                : { stopTs: togglEntry.stop ?? new Date().toISOString() }),
+              origin: "TOGGL",
+            },
+            nextRunAt: new Date(),
+          },
+        });
+
+        await prisma.outboxJob.update({
+          where: { id: locked.id },
+          data: { status: "DONE", lastError: null },
+        });
+
+        return NextResponse.json({ ok: true, processed: 1, kind: locked.kind });
+      }
+
+      // ---------- Existing handlers ----------
       case "START_TOGGL": {
-        // ---- Parse payload ----
         const payload = locked.payload as {
           userId: string;
           pageId: string;
@@ -291,18 +538,13 @@ export async function POST() {
         if (!userId || !pageId)
           throw new Error("Missing userId/pageId in payload");
 
-        // ---- Load secrets ----
         const { togglToken, notionToken } = await getUserSecrets(userId);
 
-        // ---- Fetch Notion page (to get title) ----
         const page = await getNotionPage(notionToken, pageId, apiVersion);
         const title = readTitleFromPage(page);
 
-        // ---- Get Toggl workspace ----
         const workspaceId = await getTogglWorkspaceId(togglToken);
 
-        // (Minimal version = no project/task mapping yet)
-        // ---- Start a time entry ----
         const startISO = timeStarted || new Date().toISOString();
         const entry = await startTogglTimeEntry({
           togglToken,
@@ -313,7 +555,6 @@ export async function POST() {
         const togglEntryId = entry?.id;
         if (!togglEntryId) throw new Error("No Toggl entry id returned");
 
-        // ---- Save in Notion ----
         await setNotionTogglEntryId(
           notionToken,
           pageId,
@@ -322,7 +563,6 @@ export async function POST() {
           apiVersion
         );
 
-        // ---- Create DB link (RUNNING) ----
         await prisma.timeEntryLink.create({
           data: {
             userId,
@@ -335,7 +575,6 @@ export async function POST() {
           },
         });
 
-        // ---- Mark job DONE ----
         await prisma.outboxJob.update({
           where: { id: locked.id },
           data: { status: "DONE", lastError: null },
@@ -345,7 +584,6 @@ export async function POST() {
       }
 
       case "STOP_TOGGL": {
-        // ---- Parse payload ----
         const payload = locked.payload as {
           userId: string;
           pageId: string;
@@ -357,7 +595,6 @@ export async function POST() {
           throw new Error("Missing userId/pageId in payload");
 
         const { togglToken, notionToken } = await getUserSecrets(userId);
-
         const workspaceId = await getTogglWorkspaceId(togglToken);
 
         let entryId =
@@ -380,7 +617,6 @@ export async function POST() {
           entryId = link?.togglTimeEntryId ?? null;
         }
 
-        // If we still don't have an id, treat as idempotent success.
         if (!entryId) {
           await prisma.outboxJob.update({
             where: { id: locked.id },
@@ -394,12 +630,10 @@ export async function POST() {
           });
         }
 
-        // ---- Stop in Toggl (idempotent on 404) ----
         await stopTogglTimeEntry({ togglToken, workspaceId, entryId });
 
         const endedAt = new Date();
 
-        // ---- Update DB link ----
         await prisma.timeEntryLink.updateMany({
           where: {
             userId,
@@ -414,7 +648,6 @@ export async function POST() {
           },
         });
 
-        // ---- Clear Notion property (optional but recommended) ----
         await clearNotionTogglEntryId(
           notionToken,
           pageId,
@@ -422,7 +655,6 @@ export async function POST() {
           apiVersion
         );
 
-        // ---- Mark job DONE ----
         await prisma.outboxJob.update({
           where: { id: locked.id },
           data: { status: "DONE", lastError: null },
@@ -430,6 +662,7 @@ export async function POST() {
 
         return NextResponse.json({ ok: true, processed: 1, kind: locked.kind });
       }
+
       case "NOTION_MARK_STARTED": {
         const payload = locked.payload as {
           userId: string;
@@ -447,7 +680,6 @@ export async function POST() {
         const workspaceId = await getTogglWorkspaceId(togglToken);
         const startedAt = startTs ? new Date(startTs) : new Date();
 
-        // Ensure link exists and is RUNNING (no compound unique; use findFirst)
         const existing = await prisma.timeEntryLink.findFirst({
           where: { userId, togglTimeEntryId: String(togglEntryId) },
           select: { id: true },
@@ -480,7 +712,6 @@ export async function POST() {
           });
         }
 
-        // Update Notion (TEID then date)
         await setNotionTogglEntryId(
           notionToken,
           pageId,
@@ -534,7 +765,6 @@ export async function POST() {
           "Timer Started",
           apiVersion
         );
-        // (Optionally keep or clear TEID — your webhook ignores TEID-only updates)
 
         await prisma.outboxJob.update({
           where: { id: locked.id },
