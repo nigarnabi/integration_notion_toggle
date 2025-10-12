@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 
 @custom-variant dark (&:is(.dark *));
 
@@ -116,6 +117,7 @@
   --color-primary-deep-brown: #522a27; /* grounding dark brown */
   --color-primary-brick-red: #c73e1d; /* strong red/orange accent */
   --color-primary-golden: #c59849; /* warm gold highlight */
+  --font-primary: "Inter", sans-serif;
 }
 @layer base {
   * {
@@ -123,5 +125,6 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-family: var(--font-primary);
   }
 }
