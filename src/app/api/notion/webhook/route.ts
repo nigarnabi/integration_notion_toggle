@@ -4,11 +4,10 @@ import { createHmac, timingSafeEqual } from "crypto";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
-// ---- config (property names in Notion) ----
-const DATE_PROP_NAMES = ["Timer Started", "Time Started"]; // support either
-const TEID_PROP_NAMES = ["Toggl Entry ID", "Toggl Entry Id"]; // support either
+const DATE_PROP_NAME = "Timer Started";
+const TEID_PROP_NAME = "Toggl Entry ID";
 
-// utils
+// --- utils ---
 function hmacHex(secret: string, raw: string) {
   return createHmac("sha256", secret).update(raw).digest("hex");
 }
@@ -28,25 +27,12 @@ function rtToString(rich: any): string {
     .join("")
     .trim();
 }
-function firstDefined<T>(
-  obj: Record<string, any>,
-  names: string[]
-): { name: string; value: T | undefined } {
-  for (const n of names) {
-    if (obj && Object.prototype.hasOwnProperty.call(obj, n)) {
-      // @ts-ignore
-      return { name: n, value: obj[n] as T };
-    }
-  }
-  return { name: names[0], value: undefined };
-}
 
-// ---- main handler ----
 export async function POST(req: Request) {
-  debugger;
   const secret = process.env.NOTION_WEBHOOK_SECRET || "";
 
-  const raw = await req.text(); // IMPORTANT: raw body for signature + challenge
+  // raw body is required for signature + challenge
+  const raw = await req.text();
   let body: any;
   try {
     body = JSON.parse(raw || "{}");
@@ -54,35 +40,23 @@ export async function POST(req: Request) {
     return new NextResponse("Bad JSON", { status: 400 });
   }
 
-  // 1) Handle Notion "challenge" handshake (no signature required)
+  // 1) Notion challenge
   if (body?.challenge) {
     return NextResponse.json({ challenge: body.challenge });
   }
 
-  // 2) Verify signature (Notion: x-notion-signature = sha256=<hmacHex(secret, rawBody)>)
+  // 2) Verify signature
   try {
     const incomingSig = getHeaderSig(req);
     const expectedSig = hmacHex(secret, raw);
-    console.log("🔎 raw.length =", raw.length);
-    console.log(
-      "🔎 header starts sha256=?",
-      (req.headers.get("x-notion-signature") || "").startsWith("sha256=")
-    );
-    console.log(
-      "🔎 sig lengths incoming/expected =",
-      incomingSig.length,
-      expectedSig.length
-    );
-
     if (!incomingSig || !safeEqualHex(incomingSig, expectedSig)) {
       return new NextResponse("Invalid signature", { status: 401 });
     }
-  } catch (e) {
-    console.error("Signature verify error:", e);
+  } catch {
     return new NextResponse("Signature check failed", { status: 401 });
   }
 
-  // 3) Resolve the human author
+  // 3) Resolve the human author → your user
   const person =
     (body?.authors || []).find((a: any) => a?.type === "person") ||
     (body?.accessible_by || []).find((a: any) => a?.type === "person");
@@ -95,14 +69,13 @@ export async function POST(req: Request) {
     where: { provider: "notion", providerAccountId: person.id },
     select: { userId: true, access_token: true },
   });
-  // unknown user
   if (!account?.userId || !account?.access_token) {
     return NextResponse.json({ skipped: "unknown-user" }, { status: 202 });
   }
-
   const userId = account.userId;
   const notionToken = account.access_token;
-  // page property update event
+
+  // 4) Only handle page.properties_updated
   if (
     body?.type !== "page.properties_updated" ||
     body?.entity?.type !== "page"
@@ -111,16 +84,17 @@ export async function POST(req: Request) {
   }
 
   const pageId = body.entity.id;
-  // fetch the page to get properties
+  const apiVersion = body?.api_version || "2022-06-28";
+
+  // 5) Fetch page (single snapshot)
   const pageRes = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
     headers: {
       Authorization: `Bearer ${notionToken}`,
-      "Notion-Version": body?.api_version || "2022-06-28",
+      "Notion-Version": apiVersion,
       "Content-Type": "application/json",
     },
     cache: "no-store",
   });
-
   if (!pageRes.ok) {
     console.error(
       "Notion page fetch failed:",
@@ -133,60 +107,82 @@ export async function POST(req: Request) {
   const page = await pageRes.json();
   const props = page?.properties || {};
 
-  // Extract date and TEID (support either property name variant)
-  const { value: dateProp }: { name: string; value: any } = firstDefined(
-    props,
-    DATE_PROP_NAMES
-  );
-  const { value: teidProp }: { name: string; value: any } = firstDefined(
-    props,
-    TEID_PROP_NAMES
-  );
+  const dateProp: any = props[DATE_PROP_NAME];
+  const teidProp: any = props[TEID_PROP_NAME];
 
   const timeStarted: string | null = dateProp?.date?.start ?? null;
   const togglEntryId: string = teidProp?.rich_text
     ? rtToString(teidProp.rich_text)
     : "";
 
-  // 6) Decide intent
-  let kind: "START_TOGGL" | "STOP_TOGGL" | null = null;
-  if (timeStarted && !togglEntryId) kind = "START_TOGGL";
-  else if (!timeStarted && togglEntryId) kind = "STOP_TOGGL";
+  // 6) DB-anchored transition check to avoid self-writes
+  const runningLink = await prisma.timeEntryLink.findFirst({
+    where: { userId, notionTaskPageId: pageId, status: "RUNNING" },
+    orderBy: { startTs: "desc" },
+    select: { id: true, togglTimeEntryId: true },
+  });
 
-  if (!kind) {
-    // No-op (e.g., both empty or both set) → nothing to do
+  // Transition rules:
+  // - START if Timer Started is set AND there's no RUNNING link.
+  // - STOP  if Timer Started is empty AND there is a RUNNING link.
+  // - Otherwise noop (covers TEID-only writes and retries).
+  let kind: "START_TOGGL" | "STOP_TOGGL" | null = null;
+  if (timeStarted && !runningLink) {
+    kind = "START_TOGGL";
+  } else if (!timeStarted && runningLink) {
+    kind = "STOP_TOGGL";
+  } else {
     return NextResponse.json({ ok: true, noop: true });
   }
 
-  // 7) Enqueue OutboxJob for reliable async processing
-  const idemp = `${userId}:${pageId}:${kind}:${body?.timestamp ?? Date.now()}`;
+  // 7) Strong idempotency: prefer event id; fallback deterministic key
+  const eventId: string =
+    body?.id ||
+    body?.event_id ||
+    `${pageId}:${kind}:${String(timeStarted ?? "empty")}`;
+  const idempKey = `notion:${eventId}`;
 
+  // 8) Extra guard: skip if same page+kind job already pending/running
+  const existingJob = await prisma.outboxJob.findFirst({
+    where: {
+      userId,
+      kind,
+      status: { in: ["PENDING", "RUNNING"] },
+      payload: { path: ["pageId"], equals: pageId },
+    },
+    select: { id: true },
+  });
+  if (existingJob) {
+    return NextResponse.json({ ok: true, deduped: true, kind });
+  }
+
+  // 9) Build payload
   const payload =
     kind === "START_TOGGL"
       ? {
           pageId,
           userId,
           timeStarted, // ISO string
-          apiVersion: body?.api_version,
-          origin: "NOTION",
+          apiVersion,
+          origin: "NOTION" as const,
         }
       : {
           pageId,
           userId,
-          togglEntryId,
-          apiVersion: body?.api_version,
-          origin: "NOTION",
+          togglEntryId: runningLink?.togglTimeEntryId || togglEntryId || "",
+          apiVersion,
+          origin: "NOTION" as const,
         };
 
-  // Insert if not already present
+  // 10) Enqueue with idempotency
   await prisma.outboxJob.upsert({
-    where: { idempotencyKey: idemp },
+    where: { idempotencyKey: idempKey },
     update: {},
     create: {
       userId,
       kind,
       payload,
-      idempotencyKey: idemp,
+      idempotencyKey: idempKey,
       status: "PENDING",
       nextRunAt: new Date(),
     },
