@@ -60,7 +60,40 @@ function toUnixSeconds(d: Date | string): number {
   const ms = typeof d === "string" ? new Date(d).getTime() : d.getTime();
   return Math.floor(ms / 1000);
 }
+//mapping job for entries with no link
+async function ensureMappingFromToggl(opts: { userId: string; entry: any }) {
+  const { userId, entry } = opts;
+  const updated = entryUpdatedAt(entry)?.toISOString() ?? "na";
+  const idempKey = `ensuremap:${userId}:${entry.id}:${updated}`;
 
+  await prisma.outboxJob.upsert({
+    where: { idempotencyKey: idempKey },
+    update: {},
+    create: {
+      userId,
+      kind: "ENSURE_MAPPING_FROM_TOGGL",
+      idempotencyKey: idempKey,
+      status: "PENDING",
+      payload: {
+        userId,
+        // minimal snapshot for deterministic mapping + later link:
+        togglEntry: {
+          id: String(entry.id),
+          description: entry.description ?? null,
+          start: entry.start ?? null,
+          stop: entry.stop ?? null,
+          duration: entry.duration ?? null,
+          at: entry.at ?? null,
+          project_id: entry.project_id ?? null,
+          task_id: entry.task_id ?? null,
+          workspace_id: entry.workspace_id ?? null,
+          tag_ids: entry.tag_ids ?? [],
+        },
+      },
+      nextRunAt: new Date(),
+    },
+  });
+}
 export async function POST() {
   const polledAt = now();
 
@@ -107,7 +140,12 @@ export async function POST() {
           where: { userId: u.id, togglTimeEntryId: String(e.id) },
           select: { id: true, notionTaskPageId: true },
         });
-        if (!link?.notionTaskPageId) continue; // MVP: only mirror known links
+        if (!link?.notionTaskPageId) {
+          // Ensure mapping/link materialization
+          await ensureMappingFromToggl({ userId: u.id, entry: e });
+          enqueued++;
+          continue;
+        }
 
         const idBase = `${u.id}:${e.id}:${at ? at.toISOString() : "na"}`;
 

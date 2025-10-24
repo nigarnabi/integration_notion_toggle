@@ -110,17 +110,19 @@ enum JobStatus {
 // ────────────────────────────────
 //
 
-// ---------- Task ↔ Toggl mapping ----------
+// ---------- Task  mapping ----------
 model TaskMapping {
   id               String    @id @default(cuid())
   userId           String
   notionTaskPageId String
   notionDatabaseId String?
-  togglWorkspaceId Int? // NEW
+  togglWorkspaceId Int?
   togglProjectId   String?
   togglTaskId      String?
   taskNameSnapshot String?
   lastSyncedAt     DateTime?
+
+  matchFingerprint String?
 
   user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   timeEntries TimeEntryLink[]
@@ -128,7 +130,9 @@ model TaskMapping {
   @@unique([userId, notionTaskPageId])
   @@index([userId, togglTaskId])
   @@index([userId, togglProjectId])
-  @@index([userId, togglWorkspaceId]) // NEW
+  @@index([userId, togglWorkspaceId])
+  // NEW: fast lookup by fingerprint within a user
+  @@index([userId, matchFingerprint])
 }
 
 // ---------- Timer session link (start/stop) ----------
@@ -136,7 +140,7 @@ model TimeEntryLink {
   id               String      @id @default(cuid())
   userId           String
   notionTaskPageId String
-  togglTimeEntryId String?
+  togglTimeEntryId String
   mappingId        String?
   origin           TimerOrigin
   status           TimerStatus @default(RUNNING)
@@ -144,20 +148,23 @@ model TimeEntryLink {
   stopTs           DateTime?
   lastSeenAt       DateTime?
 
-  // NEW: Toggl metadata (lets us reconcile without extra API calls)
+  // Toggl metadata
   togglWorkspaceId    Int?
   togglProjectId      String?
   togglTaskId         String?
-  togglUpdatedAt      DateTime? // last seen Toggl 'at'
+  togglUpdatedAt      DateTime?
   descriptionSnapshot String?
 
   user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   mapping TaskMapping? @relation(fields: [mappingId], references: [id], onDelete: SetNull)
 
-  @@unique([userId, togglTimeEntryId]) // ensures 1 link per entry per user
+  @@unique([userId, togglTimeEntryId]) // 1 link per entry per user
   @@index([userId, togglTimeEntryId])
   @@index([mappingId])
-  @@index([userId, notionTaskPageId, status]) // fast “is running?” checks
+  @@index([userId, notionTaskPageId, status]) // “is running?” queries
+  // NEW: poller hot paths
+  @@index([userId, togglUpdatedAt])
+  @@index([userId, togglWorkspaceId, status])
 }
 
 // ---------- Inbound Notion events (dedupe/audit) ----------
